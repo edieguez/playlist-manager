@@ -6,9 +6,16 @@
 -- and modernz.conf:
 --   playlist_mbtn_left_command=script-binding playlist_manager/select-playlist
 
-local utils = require "mp.utils"
-local msg = require "mp.msg"
+local utils   = require "mp.utils"
+local msg     = require "mp.msg"
 local assdraw = require "mp.assdraw"
+local options = require "mp.options"
+
+local opts = {
+    -- Set to false to disable yt-dlp title resolution for URL entries.
+    resolve_url_titles = true,
+}
+options.read_options(opts, "playlist_manager")
 
 local title_cache = {}
 local fetching    = {}
@@ -118,6 +125,7 @@ local function process_fetch_queue()
 end
 
 local function fetch_url_title(url)
+    if not opts.resolve_url_titles then return end
     url = normalize_url(url)
     if not is_url(url) or title_cache[url] or fetching[url] then return end
     for _, queued in ipairs(fetch_queue) do
@@ -128,6 +136,7 @@ local function fetch_url_title(url)
 end
 
 local function fetch_all()
+    if not opts.resolve_url_titles then return end
     for _, entry in ipairs(mp.get_property_native("playlist") or {}) do
         if not entry.title or entry.title == "" then
             fetch_url_title(entry.filename)
