@@ -14,6 +14,8 @@ local options = require "mp.options"
 local opts = {
     -- Set to false to disable yt-dlp title resolution for URL entries.
     resolve_url_titles = true,
+    -- Font for dialog text. Set to "" to use the OSD default font.
+    font = "mpv-osd-symbols",
 }
 options.read_options(opts, "playlist_manager")
 
@@ -22,8 +24,14 @@ local fetching    = {}
 local fetch_queue = {}
 local fetch_active = false
 
-local overlay       = mp.create_osd_overlay("ass-events")
-local toast_overlay = mp.create_osd_overlay("ass-events")
+local overlay           = mp.create_osd_overlay("ass-events")
+local toast_overlay     = mp.create_osd_overlay("ass-events")
+local text_measure_osd  = mp.create_osd_overlay("ass-events")
+-- hidden = true  → never appears on screen
+-- compute_bounds = true → update() actually returns {x0,y0,x1,y1} bounds
+text_measure_osd.hidden         = true
+text_measure_osd.compute_bounds = true
+local text_width_cache  = {}
 local toast_timer   = nil
 local cursor        = 0
 local moving        = false
@@ -32,14 +40,12 @@ local open          = false
 local search_query  = ""
 local draw_playlist  -- forward declaration (defined later, used in process_fetch_queue)
 
--- Visual constants taken directly from the mpv built-in select/console script defaults:
---   font_size=24  border_size=1.65  background_alpha=80(=0x50)  corner_radius=8
+-- Visual constants. Style mirrors ModernZ: \bord1, explicit \1c/\3c colors, \fn from opts.font.
+--   font_size=24  background_alpha=80(=0x50)  corner_radius=8
 --   padding=10    focused_color=#222222  focused_back_color=#FFFFFF  match_color=#0088FF
--- The only intentional difference: no explicit \fn tag so the OSD font is used,
--- exactly as the select script does (monospace_font="" → no \fn injected).
 local FONT_SIZE   = 24
 local CHAR_W      = FONT_SIZE * 600 / 1320  -- libass maps \fs to hhea height (1320), not UPM (1000)
-local BORDER      = 1.65
+
 local BG_ALPHA    = 0x50   -- background_alpha = 80 = 0x50 in the select script
 local CORNER      = 8
 local PAD         = 10
@@ -57,6 +63,32 @@ local function get_virt_w()
         ar = (osd.w and osd.h and osd.h > 0) and (osd.w / osd.h) or (16 / 9)
     end
     return math.floor(720 * ar)
+end
+
+-- Measure the rendered pixel width of `text` in FONT_SIZE on the current virtual
+-- canvas, using the same libass-bounds technique as modernz's estimate_text_width().
+-- Falls back to CHAR_W * #text if the overlay API is unavailable.
+local function measure_text(text)
+    if not text or #text == 0 then return 0 end
+    local key = text:gsub("%d", "0")  -- normalise digits so "123" and "456" share a cache entry
+    if text_width_cache[key] then return text_width_cache[key] end
+    local w = 0
+    if text_measure_osd and text_measure_osd.update then
+        local W = get_virt_w()
+        text_measure_osd.res_x = W
+        text_measure_osd.res_y = 720
+        local fn_tag = opts.font ~= "" and ("\\fn" .. opts.font) or ""
+        text_measure_osd.data  =
+            ("{\\fs%d\\bord0\\q2\\an7\\pos(0,0)%s}"):format(FONT_SIZE, fn_tag) .. key
+        local bounds = text_measure_osd:update()
+        if bounds and bounds.x0 and bounds.x1 then
+            local bearing_correction = FONT_SIZE * 0.08 * 2
+            w = math.max(0, (bounds.x1 - bounds.x0) - bearing_correction)
+        end
+    end
+    if w == 0 then w = math.ceil(#text * CHAR_W) end  -- fallback
+    text_width_cache[key] = w
+    return w
 end
 
 local function normalize_url(path)
@@ -202,7 +234,7 @@ local function show_toast(msg, success)
     local prefix = success and "✓ " or "✗ "
     local full   = prefix .. msg
 
-    local cw = math.min(math.ceil(#full * CHAR_W), W - PAD * 4)
+    local cw = math.min(measure_text(full), W - PAD * 4)
 
     local x   = PAD * 2
     local y   = PAD * 2
@@ -220,10 +252,11 @@ local function show_toast(msg, success)
     ass:round_rect_cw(-PAD, -TPAD, cw + PAD, FONT_SIZE + TPAD, CORNER, CORNER)
     ass:draw_stop()
 
+    local fn_tag = opts.font ~= "" and ("\\fn" .. opts.font) or ""
     ass:new_event()
     ass:an(4)
     ass:pos(x, y + FONT_SIZE / 2)
-    ass:append(("{\\r\\fs%d\\bord%.2f\\fsp0\\q2\\blur0\\1c&H%s&}"):format(FONT_SIZE, BORDER, col))
+    ass:append(("{\\bord1\\1c&H%s&\\3c&H000000&\\fs%d\\q2%s}"):format(col, FONT_SIZE, fn_tag))
     ass:append(prefix)
     ass:append("{\\1c&HFFFFFF&}")
     ass:append(msg)
@@ -259,13 +292,18 @@ draw_playlist = function()
 
     local prompt = search_query ~= "" and ("Select a playlist entry: " .. search_query) or "Select a playlist entry: "
 
-    -- Measure dialog width from the widest string across all titles and the prompt
-    local longest = prompt
+    -- Measure dialog width from the widest string across all titles and the prompt.
+    -- Uses real libass bounds (same as modernz's estimate_text_width) so the dialog
+    -- is exactly as wide as its content, not an over-wide character-count estimate.
+    local cw = measure_text(prompt)
     for i = 0, #playlist - 1 do
         local t = "→ " .. (get_playlist_item_title(i) or "")
-        if #t > #longest then longest = t end
+        local w = measure_text(t)
+        if w > cw then cw = w end
     end
-    local cw = math.min(math.ceil(#longest * CHAR_W), W - PAD * 4)
+    -- Clear the cache after each draw so stale entries don't accumulate indefinitely.
+    text_width_cache = {}
+    cw = math.min(cw, W - PAD * 4)
 
     -- Clamp cursor into the current filtered list
     if n > 0 then cursor = math.max(0, math.min(cursor, n - 1)) end
@@ -276,10 +314,11 @@ draw_playlist = function()
     local y = H / 2 - (vis_max + 1.5) * LH / 2  -- anchored to full-size top; only height shrinks
 
     local clip        = ("\\clip(0,0,%d,%d)"):format(math.floor(x + cw), H)
-    -- No \fn tag → uses OSD default font, matching select script (monospace_font="")
-    local sty         = ("{\\r\\fs%d\\bord%.2f\\fsp0\\q2\\blur0%s}"):format(FONT_SIZE, BORDER, clip)
-    -- Focused: dark text (#222222 = focused_color) over the white box drawn below
-    local focused_sty = ("{\\r\\fs%d\\bord0\\fsp0\\q2\\blur0\\1c&H222222&%s}"):format(FONT_SIZE, clip)
+    local fn_tag      = opts.font ~= "" and ("\\fn" .. opts.font) or ""
+    -- Style mirrors ModernZ: explicit text/outline colors, no \r reset, no blur/fsp overrides
+    local sty         = ("{\\bord1\\1c&HFFFFFF&\\3c&H000000&\\fs%d\\q2%s%s}"):format(FONT_SIZE, fn_tag, clip)
+    -- Focused: dark text (#222222) over the white highlight box drawn below
+    local focused_sty = ("{\\bord0\\1c&H222222&\\3c&H000000&\\fs%d\\q2%s%s}"):format(FONT_SIZE, fn_tag, clip)
 
     local ass = assdraw.ass_new()
 
