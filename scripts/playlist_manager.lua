@@ -14,8 +14,6 @@ local options = require "mp.options"
 local opts = {
     -- Set to false to disable yt-dlp title resolution for URL entries.
     resolve_url_titles = true,
-    -- Font for dialog text. Set to "" to use the OSD default font.
-    font = "mpv-osd-symbols",
 }
 options.read_options(opts, "playlist_manager")
 
@@ -40,11 +38,11 @@ local open          = false
 local search_query  = ""
 local draw_playlist  -- forward declaration (defined later, used in process_fetch_queue)
 
--- Visual constants. Style mirrors ModernZ: \bord1, explicit \1c/\3c colors, \fn from opts.font.
+-- Visual constants. Style mirrors ModernZ: \bord1, explicit \1c/\3c colors.
 --   font_size=24  background_alpha=80(=0x50)  corner_radius=8
 --   padding=10    focused_color=#222222  focused_back_color=#FFFFFF  match_color=#0088FF
 local FONT_SIZE   = 24
-local CHAR_W      = FONT_SIZE * 600 / 1320  -- libass maps \fs to hhea height (1320), not UPM (1000)
+local CHAR_W      = FONT_SIZE * 0.6          -- conservative fallback: ~14 px/char at fs24 for proportional Latin fonts
 
 local BG_ALPHA    = 0x50   -- background_alpha = 80 = 0x50 in the select script
 local CORNER      = 8
@@ -77,13 +75,11 @@ local function measure_text(text)
         local W = get_virt_w()
         text_measure_osd.res_x = W
         text_measure_osd.res_y = 720
-        local fn_tag = opts.font ~= "" and ("\\fn" .. opts.font) or ""
         text_measure_osd.data  =
-            ("{\\fs%d\\bord0\\q2\\an7\\pos(0,0)%s}"):format(FONT_SIZE, fn_tag) .. key
+            ("{\\fs%d\\bord0\\q2\\an7\\pos(0,0)}"):format(FONT_SIZE) .. key
         local bounds = text_measure_osd:update()
         if bounds and bounds.x0 and bounds.x1 then
-            local bearing_correction = FONT_SIZE * 0.08 * 2
-            w = math.max(0, (bounds.x1 - bounds.x0) - bearing_correction)
+            w = math.max(0, bounds.x1 - bounds.x0)
         end
     end
     if w == 0 then w = math.ceil(#text * CHAR_W) end  -- fallback
@@ -232,9 +228,10 @@ local function show_toast(msg, success)
 
     local W, H   = get_virt_w(), 720
     local prefix = success and "✓ " or "✗ "
-    local full   = prefix .. msg
+    local max_w  = W - PAD * 4
 
-    local cw = math.min(measure_text(full), W - PAD * 4)
+    local full = prefix .. msg
+    local cw   = math.min(measure_text(full), max_w)
 
     local x   = PAD * 2
     local y   = PAD * 2
@@ -252,11 +249,11 @@ local function show_toast(msg, success)
     ass:round_rect_cw(-PAD, -TPAD, cw + PAD, FONT_SIZE + TPAD, CORNER, CORNER)
     ass:draw_stop()
 
-    local fn_tag = opts.font ~= "" and ("\\fn" .. opts.font) or ""
+    local clip   = ("\\clip(0,0,%d,%d)"):format(math.floor(x + cw), H)
     ass:new_event()
     ass:an(4)
     ass:pos(x, y + FONT_SIZE / 2)
-    ass:append(("{\\bord1\\1c&H%s&\\3c&H000000&\\fs%d\\q2%s}"):format(col, FONT_SIZE, fn_tag))
+    ass:append(("{\\bord1\\1c&H%s&\\3c&H000000&\\fs%d\\fsp0\\q2%s}"):format(col, FONT_SIZE, clip))
     ass:append(prefix)
     ass:append("{\\1c&HFFFFFF&}")
     ass:append(msg)
@@ -290,12 +287,12 @@ draw_playlist = function()
     -- This keeps the position fixed while the height shrinks to match search results.
     local vis_max  = math.min(math.max(#playlist, 1), MAX_VISIBLE)
 
-    local prompt = search_query ~= "" and ("Select a playlist entry: " .. search_query) or "Select a playlist entry: "
+    local prompt_text = "Select a playlist entry: " .. search_query
 
     -- Measure dialog width from the widest string across all titles and the prompt.
     -- Uses real libass bounds (same as modernz's estimate_text_width) so the dialog
     -- is exactly as wide as its content, not an over-wide character-count estimate.
-    local cw = measure_text(prompt)
+    local cw = measure_text(prompt_text)
     for i = 0, #playlist - 1 do
         local t = "→ " .. (get_playlist_item_title(i) or "")
         local w = measure_text(t)
@@ -314,11 +311,10 @@ draw_playlist = function()
     local y = H / 2 - (vis_max + 1.5) * LH / 2  -- anchored to full-size top; only height shrinks
 
     local clip        = ("\\clip(0,0,%d,%d)"):format(math.floor(x + cw), H)
-    local fn_tag      = opts.font ~= "" and ("\\fn" .. opts.font) or ""
-    -- Style mirrors ModernZ: explicit text/outline colors, no \r reset, no blur/fsp overrides
-    local sty         = ("{\\bord1\\1c&HFFFFFF&\\3c&H000000&\\fs%d\\q2%s%s}"):format(FONT_SIZE, fn_tag, clip)
+    -- Style mirrors ModernZ: explicit text/outline colors, no \r reset.
+    local sty         = ("{\\bord1\\1c&HFFFFFF&\\3c&H000000&\\fs%d\\fsp0\\q2%s}"):format(FONT_SIZE, clip)
     -- Focused: dark text (#222222) over the white highlight box drawn below
-    local focused_sty = ("{\\bord0\\1c&H222222&\\3c&H000000&\\fs%d\\q2%s%s}"):format(FONT_SIZE, fn_tag, clip)
+    local focused_sty = ("{\\bord0\\1c&H222222&\\3c&H000000&\\fs%d\\fsp0\\q2%s}"):format(FONT_SIZE, clip)
 
     local ass = assdraw.ass_new()
 
@@ -332,10 +328,14 @@ draw_playlist = function()
     ass:draw_stop()
 
     -- ── Prompt ──────────────────────────────────────────────────────────────
+    -- Cursor: 1-unit-wide ASS drawing + \xbord0.5 on each side → ~1px thin bar,
+    -- matching the cursor glyph used by mpv's built-in mp.input select dialog.
+    local cglyph = ("{\\r\\blur0\\1c&HFFFFFF&\\3c&HFFFFFF&\\xbord0.5\\ybord0\\xshad0\\yshad1\\p4\\pbo24}" ..
+                    "m 0 0 l 1 0 l 1 %d l 0 %d{\\p0}"):format(FONT_SIZE * 8, FONT_SIZE * 8)
     ass:new_event()
     ass:an(7)
     ass:pos(x, y)
-    ass:append(sty .. prompt)
+    ass:append(sty .. prompt_text .. cglyph)
 
     -- ── Items ───────────────────────────────────────────────────────────────
     if n == 0 then
@@ -592,8 +592,7 @@ mp.add_key_binding("ctrl+v", "paste-url", function()
     mp.commandv("loadfile", raw, "append-play")
     fetch_url_title(raw)
 
-    local label = #raw > 55 and (raw:sub(1, 52) .. "…") or raw
-    show_toast("Added: " .. label, true)
+    show_toast("Added: " .. raw, true)
 
     if open then draw_playlist() end
 end)
