@@ -68,7 +68,7 @@ end
 -- Falls back to CHAR_W * #text if the overlay API is unavailable.
 local function measure_text(text)
     if not text or #text == 0 then return 0 end
-    local key = text:gsub("%d", "0")  -- normalise digits so "123" and "456" share a cache entry
+    local key = text
     if text_width_cache[key] then return text_width_cache[key] end
     local w = 0
     if text_measure_osd and text_measure_osd.update then
@@ -76,7 +76,7 @@ local function measure_text(text)
         text_measure_osd.res_x = W
         text_measure_osd.res_y = 720
         text_measure_osd.data  =
-            ("{\\fs%d\\bord0\\q2\\an7\\pos(0,0)}"):format(FONT_SIZE) .. key
+            ("{\\fs%d\\bord0\\q2\\an7\\pos(0,0)}"):format(FONT_SIZE) .. text
         local bounds = text_measure_osd:update()
         if bounds and bounds.x0 and bounds.x1 then
             w = math.max(0, bounds.x1 - bounds.x0)
@@ -298,8 +298,10 @@ draw_playlist = function()
         local w = measure_text(t)
         if w > cw then cw = w end
     end
-    -- Clear the cache after each draw so stale entries don't accumulate indefinitely.
-    text_width_cache = {}
+    -- Evict cache when it grows large to prevent unbounded memory use.
+    local cache_count = 0
+    for _ in pairs(text_width_cache) do cache_count = cache_count + 1 end
+    if cache_count > 200 then text_width_cache = {} end
     cw = math.min(cw, W - PAD * 4)
 
     -- Clamp cursor into the current filtered list
@@ -411,12 +413,21 @@ local function close_playlist()
     mp.remove_key_binding("pl-up")
     mp.remove_key_binding("pl-down")
     mp.remove_key_binding("pl-enter")
+    mp.remove_key_binding("pl-enter-meta")
     mp.remove_key_binding("pl-right")
     mp.remove_key_binding("pl-left")
     mp.remove_key_binding("pl-esc")
     mp.remove_key_binding("pl-unicode")
     mp.remove_key_binding("pl-bs")
     mp.remove_key_binding("pl-del")
+    mp.remove_key_binding("pl-del-meta")
+    mp.remove_key_binding("pl-vim-up")
+    mp.remove_key_binding("pl-vim-up-meta")
+    mp.remove_key_binding("pl-vim-down")
+    mp.remove_key_binding("pl-vim-down-meta")
+    mp.remove_key_binding("pl-vim-right")
+    mp.remove_key_binding("pl-vim-right-meta")
+    mp.remove_key_binding("pl-vim-left")
 end
 
 local function show_playlist_selector()
@@ -470,7 +481,7 @@ local function show_playlist_selector()
         end
     end)
 
-    mp.add_forced_key_binding("ENTER", "pl-enter", function()
+    local function do_enter()
         if moving then
             moving = false
             draw_playlist()
@@ -482,7 +493,9 @@ local function show_playlist_selector()
                 mp.set_property("playlist-pos", idx)
             end
         end
-    end)
+    end
+    mp.add_forced_key_binding("ENTER",      "pl-enter",      do_enter)
+    mp.add_forced_key_binding("meta+ENTER", "pl-enter-meta", do_enter)
 
     -- Reordering is blocked while a search filter is active
     mp.add_forced_key_binding("RIGHT", "pl-right", function()
@@ -524,7 +537,7 @@ local function show_playlist_selector()
     mp.add_forced_key_binding("any_unicode", "pl-unicode", function(event)
         if moving or event.event == "up" then return end
         local char = event.key_text or ""
-        if char == "" then return end
+        if char == "" or char:match("%c") then return end
         search_query = search_query .. char
         cursor = 0
         draw_playlist()
@@ -541,7 +554,59 @@ local function show_playlist_selector()
         end
     end, {repeatable = true})
 
-    mp.add_forced_key_binding("ctrl+BS", "pl-del", function()
+    local function vim_up()
+        if moving then
+            local count = mp.get_property_number("playlist-count", 0)
+            if cursor > 0 then
+                mp.commandv("playlist-move", cursor, cursor - 1)
+                cursor = cursor - 1
+            else
+                mp.commandv("playlist-move", 0, count)
+                cursor = count - 1
+            end
+            draw_playlist()
+        else
+            local n = #compute_filtered(mp.get_property_native("playlist") or {})
+            cursor = (cursor - 1 + n) % n
+            draw_playlist()
+        end
+    end
+    local function vim_down()
+        if moving then
+            local count = mp.get_property_number("playlist-count", 0)
+            if cursor < count - 1 then
+                mp.commandv("playlist-move", cursor, cursor + 2)
+                cursor = cursor + 1
+            else
+                mp.commandv("playlist-move", count - 1, 0)
+                cursor = 0
+            end
+            draw_playlist()
+        else
+            local n = #compute_filtered(mp.get_property_native("playlist") or {})
+            cursor = (cursor + 1) % n
+            draw_playlist()
+        end
+    end
+    local function vim_right()
+        if not moving and search_query == "" then
+            move_origin = cursor
+            moving = true
+            draw_playlist()
+        end
+    end
+    local function vim_left()
+        if moving then moving = false; draw_playlist() end
+    end
+    mp.add_forced_key_binding("ctrl+k",  "pl-vim-up",         vim_up)
+    mp.add_forced_key_binding("meta+k",  "pl-vim-up-meta",    vim_up)
+    mp.add_forced_key_binding("ctrl+j",  "pl-vim-down",       vim_down)
+    mp.add_forced_key_binding("meta+j",  "pl-vim-down-meta",  vim_down)
+    mp.add_forced_key_binding("ctrl+l",  "pl-vim-right",      vim_right)
+    mp.add_forced_key_binding("meta+l",  "pl-vim-right-meta", vim_right)
+    mp.add_forced_key_binding("ctrl+h",  "pl-vim-left",       vim_left)
+
+    local function delete_item()
         if moving then return end
         local playlist = mp.get_property_native("playlist") or {}
         local filtered = compute_filtered(playlist)
@@ -553,7 +618,9 @@ local function show_playlist_selector()
         if n == 0 then close_playlist(); return end
         cursor = math.max(0, math.min(cursor, n - 1))
         draw_playlist()
-    end)
+    end
+    mp.add_forced_key_binding("ctrl+BS", "pl-del",      delete_item)
+    mp.add_forced_key_binding("meta+BS", "pl-del-meta", delete_item)
 end
 
 local prev_playlist_count = 0
