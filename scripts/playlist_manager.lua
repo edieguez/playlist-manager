@@ -648,6 +648,17 @@ mp.observe_property("playlist-count", "number", function(_, count)
     end
     -- Re-read the actual count after dedup so removals don't look like additions.
     prev_playlist_count = mp.get_property_number("playlist-count", 0)
+    -- Redraw for an external removal (e.g. perpetual_playlist.lua's
+    -- drop_finished_items) happening while the dialog is open - the
+    -- playlist-pos observer below doesn't reliably catch this: dropping
+    -- the currently-playing *first* item shifts the next item into that
+    -- same numeric index (0 -> 0), so playlist-pos never actually changes
+    -- value and its own observer never fires, leaving the dialog stale
+    -- until closed and reopened. This observer is the one that does
+    -- reliably fire on any count change regardless of *which* index
+    -- changed, so it's the right place for this rather than trying to
+    -- catch it via playlist-pos.
+    if open then draw_playlist() end
 end)
 mp.observe_property("playlist-pos", "number", function()
     -- Real navigation invalidates any in-progress "mpv-add-item-next"
