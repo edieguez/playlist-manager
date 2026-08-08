@@ -22,6 +22,14 @@ local fetching    = {}
 local fetch_queue = {}
 local fetch_active = false
 
+-- Tracks the absolute playlist index for the next "mpv-add-item-next"
+-- insert (see the handler below). nil means "no next-batch in progress" -
+-- recompute fresh from playlist-pos on the next insert. Reset whenever
+-- playlist-pos actually changes (see the observer near the end of this
+-- file), so a stale batch never keeps appending after an old position
+-- once real navigation has happened.
+local next_insert_index = nil
+
 local overlay           = mp.create_osd_overlay("ass-events")
 local toast_overlay     = mp.create_osd_overlay("ass-events")
 local text_measure_osd  = mp.create_osd_overlay("ass-events")
@@ -634,6 +642,10 @@ mp.observe_property("playlist-count", "number", function(_, count)
     prev_playlist_count = mp.get_property_number("playlist-count", 0)
 end)
 mp.observe_property("playlist-pos", "number", function()
+    -- Real navigation invalidates any in-progress "mpv-add-item-next"
+    -- batch - a later, unrelated one should recompute its base position
+    -- fresh rather than keep appending after a now-stale index.
+    next_insert_index = nil
     if open then draw_playlist() end
 end)
 mp.add_key_binding(nil, "select-playlist", show_playlist_selector)
@@ -682,6 +694,50 @@ mp.register_script_message("mpv-add-item", function(item)
     fetch_url_title(item)
 
     show_toast("Added: " .. item, true)
+
+    if open then draw_playlist() end
+end)
+
+-- Entry point for `mpv-add -n`/`--next`, sent the same way as
+-- "mpv-add-item" above but inserting right after whatever's currently
+-- playing instead of appending to the end - the "Play Next" counterpart
+-- to "Add to Queue". Uses an absolute insertion index (via loadfile's
+-- insert-at) rather than mpv's relative insert-next, since repeated
+-- insert-next calls reverse multi-item order and misbehave when starting
+-- from a fully idle player (the first insert redefines what's "current"
+-- out from under the trick). next_insert_index tracks that absolute
+-- index across a whole batch of "next" adds sent in one mpv-add
+-- invocation (or several in quick succession before any real navigation
+-- happens - see the playlist-pos observer above), so multiple items stay
+-- in the order they were given instead of landing reversed or scattered.
+mp.register_script_message("mpv-add-item-next", function(item)
+    if not item or item == "" then return end
+
+    if is_in_playlist(item) then
+        show_toast("Already in playlist", false)
+        return
+    end
+
+    -- Only the very first insert of a fresh batch is allowed to kick off
+    -- playback (insert-at-play) if the player was idle. Using -play for
+    -- every item in the batch would race: loadfile returns before the
+    -- file actually starts loading (per its own docs), so a second
+    -- insert-at-play fired moments later can still see "nothing playing
+    -- yet" and hijack playback out from under the first item. Plain
+    -- insert-at for the rest sidesteps that race entirely - by then
+    -- something is either already playing, or about to be.
+    local is_batch_start = next_insert_index == nil
+    if is_batch_start then
+        local pos = mp.get_property_number("playlist-pos", -1)
+        next_insert_index = (pos >= 0) and (pos + 1) or 0
+    end
+
+    local flag = is_batch_start and "insert-at-play" or "insert-at"
+    mp.commandv("loadfile", item, flag, tostring(next_insert_index))
+    next_insert_index = next_insert_index + 1
+    fetch_url_title(item)
+
+    show_toast("Added next: " .. item, true)
 
     if open then draw_playlist() end
 end)
