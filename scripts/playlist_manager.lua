@@ -663,3 +663,25 @@ mp.add_key_binding("ctrl+v", "paste-url", function()
 
     if open then draw_playlist() end
 end)
+
+-- Entry point for plugins/perpetual-playlist/bin/mpv-add, sent over the
+-- IPC socket as `script-message-to playlist_manager mpv-add-item <item>`
+-- instead of a raw `loadfile` - so an item that's already in the running
+-- instance's playlist gets ignored the same way ctrl+v/paste-url ignores
+-- one, instead of briefly being added and only cleaned up after the fact
+-- by dedup_playlist() below.
+mp.register_script_message("mpv-add-item", function(item)
+    if not item or item == "" then return end
+
+    if is_in_playlist(item) then
+        show_toast("Already in playlist", false)
+        return
+    end
+
+    mp.commandv("loadfile", item, "append-play")
+    fetch_url_title(item)
+
+    show_toast("Added: " .. item, true)
+
+    if open then draw_playlist() end
+end)
