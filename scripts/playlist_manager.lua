@@ -676,68 +676,181 @@ mp.add_key_binding("ctrl+v", "paste-url", function()
     if open then draw_playlist() end
 end)
 
+-- Runs yt-dlp synchronously to check whether `item` is actually a
+-- playlist (a directory or channel/playlist URL that expands into many
+-- videos) rather than a single video. Only meaningful for URLs - local
+-- files/directories are returned unchanged here and handled directly in
+-- add_single_item() via loadlist instead, which resolves a local
+-- directory without needing yt-dlp at all.
+--
+-- mpv's own loadfile only resolves a playlist URL lazily - only once mpv
+-- actually gets around to playing that specific entry - so a playlist
+-- queued behind something that's currently playing would otherwise sit
+-- as a single inert entry until playback naturally reaches it. Nothing
+-- is lost, but it looks broken and can stay that way indefinitely.
+-- Pre-resolving here instead makes it expand immediately.
+--
+-- Blocking: adds yt-dlp startup + a network round-trip (roughly half a
+-- second to a couple of seconds) to every URL add, not just playlists -
+-- an accepted tradeoff for correct, immediate, correctly-ordered
+-- expansion. Any failure (non-zero exit, unparseable JSON, not actually a
+-- playlist) falls back to returning the item unchanged, so a single
+-- video, an unsupported site, or a transient network hiccup degrade to
+-- today's lazy-loadfile behavior rather than blocking the add.
+local function resolve_playlist_entries(item)
+    if not is_url(item) then
+        return { item }
+    end
+
+    local res = mp.command_native({
+        name = "subprocess",
+        args = {"yt-dlp", "--no-warnings", "--flat-playlist", "-sJ", "--no-config", item},
+        capture_stdout = true,
+        capture_stderr = true,
+    })
+    if not res or res.status ~= 0 or not res.stdout or res.stdout == "" then
+        return { item }
+    end
+
+    local ok, data = pcall(utils.parse_json, res.stdout)
+    if not ok or type(data) ~= "table" or data._type ~= "playlist"
+       or type(data.entries) ~= "table" or #data.entries == 0 then
+        return { item }
+    end
+
+    local entries = {}
+    for _, entry in ipairs(data.entries) do
+        if entry.url then
+            if entry.title then
+                -- Seeds the title cache from data we already have, so
+                -- fetch_url_title() below is a no-op for these instead of
+                -- firing a redundant yt-dlp call per expanded entry.
+                title_cache[normalize_url(entry.url)] = entry.title
+            end
+            table.insert(entries, entry.url)
+        end
+    end
+
+    return #entries > 0 and entries or { item }
+end
+
+-- Adds one already-resolved item (never a playlist URL by this point -
+-- see resolve_playlist_entries above), either appending to the end or,
+-- with next_mode, inserting right after whatever's currently playing.
+-- `quiet` suppresses the per-item toast/redraw, used when the caller is
+-- about to show a single aggregate toast instead (a playlist expanding
+-- into many entries shouldn't fire one toast per video). Returns true if
+-- the item was actually added, false if it was skipped as a duplicate.
+--
+-- Tries loadlist before loadfile, but ONLY for local paths, never URLs:
+-- loadlist resolves a local directory immediately (same purpose as
+-- --playlist), where loadfile would only resolve it lazily once actually
+-- played, and cleanly fails (via mp.commandv's own true/nil+error return)
+-- for a plain local file, making loadfile there a no-op fallback.
+--
+-- Deliberately NOT tried for URLs, even though the same "clean failure"
+-- held for a bogus/unsupported one in testing: for a normal YouTube watch
+-- URL, loadlist does NOT fail the way a local plain file does - it
+-- "succeeds" by pulling in YouTube's autoplay/"up next" mix as a giant
+-- playlist (83 unrelated videos in testing, for a single watch URL).
+-- Playlist URLs are already handled correctly ahead of this, by
+-- resolve_playlist_entries's yt-dlp pre-expansion - any URL reaching this
+-- function is either a genuine single video, or (rare fallback) a
+-- playlist yt-dlp itself failed to resolve, and either way it must go
+-- through loadfile, not loadlist.
+local function add_single_item(item, next_mode, quiet)
+    if is_in_playlist(item) then
+        if not quiet then show_toast("Already in playlist", false) end
+        return false
+    end
+
+    local try_loadlist = not is_url(item)
+
+    if next_mode then
+        -- Only the very first insert of a fresh batch is allowed to kick
+        -- off playback (*-play) if the player was idle. Using -play for
+        -- every item would race: loadfile/loadlist return before the file
+        -- actually starts loading (per their own docs), so a later insert
+        -- fired moments later can still see "nothing playing yet" and
+        -- hijack playback out from under an earlier item. Plain insert-at
+        -- for the rest sidesteps that race entirely - by then something
+        -- is either already playing, or about to be.
+        local is_batch_start = next_insert_index == nil
+        if is_batch_start then
+            local pos = mp.get_property_number("playlist-pos", -1)
+            next_insert_index = (pos >= 0) and (pos + 1) or 0
+        end
+
+        local flag = is_batch_start and "insert-at-play" or "insert-at"
+        local index = tostring(next_insert_index)
+        if not (try_loadlist and mp.commandv("loadlist", item, flag, index)) then
+            mp.commandv("loadfile", item, flag, index)
+        end
+        next_insert_index = next_insert_index + 1
+    else
+        if not (try_loadlist and mp.commandv("loadlist", item, "append-play")) then
+            mp.commandv("loadfile", item, "append-play")
+        end
+    end
+
+    fetch_url_title(item)
+
+    if not quiet then
+        show_toast((next_mode and "Added next: " or "Added: ") .. item, true)
+        if open then draw_playlist() end
+    end
+
+    return true
+end
+
 -- Entry point for plugins/perpetual-playlist/bin/mpv-add, sent over the
 -- IPC socket as `script-message-to playlist_manager mpv-add-item <item>`
 -- instead of a raw `loadfile` - so an item that's already in the running
 -- instance's playlist gets ignored the same way ctrl+v/paste-url ignores
 -- one, instead of briefly being added and only cleaned up after the fact
--- by dedup_playlist() below.
+-- by dedup_playlist() below. A playlist URL or directory is pre-resolved
+-- into its individual entries first (see resolve_playlist_entries), so
+-- they all show up immediately instead of one inert placeholder.
 mp.register_script_message("mpv-add-item", function(item)
     if not item or item == "" then return end
 
-    if is_in_playlist(item) then
-        show_toast("Already in playlist", false)
+    local entries = resolve_playlist_entries(item)
+    if #entries == 1 then
+        add_single_item(entries[1], false, false)
         return
     end
 
-    mp.commandv("loadfile", item, "append-play")
-    fetch_url_title(item)
-
-    show_toast("Added: " .. item, true)
-
+    local added = 0
+    for _, entry in ipairs(entries) do
+        if add_single_item(entry, false, true) then
+            added = added + 1
+        end
+    end
+    show_toast("Added " .. added .. " item(s) from playlist", true)
     if open then draw_playlist() end
 end)
 
--- Entry point for `mpv-add -n`/`--next`, sent the same way as
--- "mpv-add-item" above but inserting right after whatever's currently
--- playing instead of appending to the end - the "Play Next" counterpart
--- to "Add to Queue". Uses an absolute insertion index (via loadfile's
--- insert-at) rather than mpv's relative insert-next, since repeated
--- insert-next calls reverse multi-item order and misbehave when starting
--- from a fully idle player (the first insert redefines what's "current"
--- out from under the trick). next_insert_index tracks that absolute
--- index across a whole batch of "next" adds sent in one mpv-add
--- invocation (or several in quick succession before any real navigation
--- happens - see the playlist-pos observer above), so multiple items stay
--- in the order they were given instead of landing reversed or scattered.
+-- Entry point for `mpv-add -n`/`--next` - see mpv-add-item above for the
+-- playlist/directory pre-resolution and the toast-batching rationale, and
+-- add_single_item for the absolute-index insertion logic (inserting right
+-- after whatever's currently playing instead of appending to the end,
+-- preserving order across multiple items - including every entry of an
+-- expanded playlist - via next_insert_index).
 mp.register_script_message("mpv-add-item-next", function(item)
     if not item or item == "" then return end
 
-    if is_in_playlist(item) then
-        show_toast("Already in playlist", false)
+    local entries = resolve_playlist_entries(item)
+    if #entries == 1 then
+        add_single_item(entries[1], true, false)
         return
     end
 
-    -- Only the very first insert of a fresh batch is allowed to kick off
-    -- playback (insert-at-play) if the player was idle. Using -play for
-    -- every item in the batch would race: loadfile returns before the
-    -- file actually starts loading (per its own docs), so a second
-    -- insert-at-play fired moments later can still see "nothing playing
-    -- yet" and hijack playback out from under the first item. Plain
-    -- insert-at for the rest sidesteps that race entirely - by then
-    -- something is either already playing, or about to be.
-    local is_batch_start = next_insert_index == nil
-    if is_batch_start then
-        local pos = mp.get_property_number("playlist-pos", -1)
-        next_insert_index = (pos >= 0) and (pos + 1) or 0
+    local added = 0
+    for _, entry in ipairs(entries) do
+        if add_single_item(entry, true, true) then
+            added = added + 1
+        end
     end
-
-    local flag = is_batch_start and "insert-at-play" or "insert-at"
-    mp.commandv("loadfile", item, flag, tostring(next_insert_index))
-    next_insert_index = next_insert_index + 1
-    fetch_url_title(item)
-
-    show_toast("Added next: " .. item, true)
-
+    show_toast("Added " .. added .. " item(s) next from playlist", true)
     if open then draw_playlist() end
 end)
