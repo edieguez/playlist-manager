@@ -30,6 +30,14 @@ local fetch_active = false
 -- once real navigation has happened.
 local next_insert_index = nil
 
+-- Distinguishes "more items from the same mpv-add -n invocation" (share
+-- a batch ID, stay in the order given relative to each other) from "a
+-- separate, later mpv-add -n call" (different ID, or none at all - see
+-- the handler below), which should always insert right after whatever's
+-- currently playing rather than continuing to append after wherever the
+-- previous call's items landed.
+local last_next_batch_id = nil
+
 local overlay           = mp.create_osd_overlay("ass-events")
 local toast_overlay     = mp.create_osd_overlay("ass-events")
 local text_measure_osd  = mp.create_osd_overlay("ass-events")
@@ -836,8 +844,23 @@ end)
 -- after whatever's currently playing instead of appending to the end,
 -- preserving order across multiple items - including every entry of an
 -- expanded playlist - via next_insert_index).
-mp.register_script_message("mpv-add-item-next", function(item)
+--
+-- batch_id (mpv-add's own PID, or empty/missing for anything else that
+-- might send this message by hand) distinguishes multiple items from the
+-- *same* mpv-add -n invocation, which should stay in the order given
+-- relative to each other (next_insert_index left alone - it's mid-batch),
+-- from a separate, later invocation, which should always land right
+-- after whatever's currently playing rather than continuing to append
+-- after wherever the previous call's items ended up. A missing/empty
+-- batch_id always counts as "new" (the safer default), so this only ever
+-- suppresses a reset when there's positive evidence it's a continuation.
+mp.register_script_message("mpv-add-item-next", function(item, batch_id)
     if not item or item == "" then return end
+
+    if not batch_id or batch_id == "" or batch_id ~= last_next_batch_id then
+        next_insert_index = nil
+        last_next_batch_id = batch_id
+    end
 
     local entries = resolve_playlist_entries(item)
     if #entries == 1 then
