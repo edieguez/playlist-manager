@@ -1,0 +1,91 @@
+#!/bin/sh
+# plugins/playlist-manager/bin/mpv-add
+#
+# Add one or more URLs/paths to the running mpv instance's playlist
+# (appended to the end, in order - or, with -n/--next, inserted right
+# after whatever's currently playing, in order), or start a fresh mpv
+# instance with all of them if none is running - the sibling
+# perpetual-playlist plugin's startup logic (if installed) then puts them
+# first and plays them in order regardless of -n/--next (cmdline items
+# already play first on a fresh instance, which is the same "play next"
+# outcome).
+#
+# Requires `input-ipc-server=~~cache/mpv.sock` in mpv's config - mpv's own
+# ~~cache/ meta-path resolves differently per platform (confirmed
+# empirically, not just from docs): ~/.cache/mpv/ on Linux,
+# ~/Library/Caches/io.mpv/ on macOS. Mirrored here so this default matches
+# without the user needing to set MPV_SOCKET.
+set -eu
+
+case "$(uname -s)" in
+    Darwin) default_socket="$HOME/Library/Caches/io.mpv/mpv.sock" ;;
+    *)      default_socket="$HOME/.cache/mpv/mpv.sock" ;;
+esac
+SOCKET="${MPV_SOCKET:-$default_socket}"
+
+usage() {
+    echo "Usage: mpv-add [-n|--next] <url-or-path> [url-or-path ...]" >&2
+    exit 1
+}
+
+MESSAGE="mpv-add-item"
+# One ID per invocation (this script's own PID - unique per invocation,
+# no portability concerns unlike a nanosecond timestamp, which BSD/macOS
+# `date` doesn't support the way GNU `date` does), so playlist_manager.lua
+# can tell "more items from this same mpv-add call" (share this ID, stay
+# in the order given relative to each other) apart from "a separate,
+# later mpv-add -n call" (different ID, always inserts right after
+# whatever's currently playing, displacing anything queued there instead
+# of landing after it). Unused/ignored by the plain-append handler.
+BATCH_ID="$$"
+case "${1:-}" in
+    -n|--next)
+        MESSAGE="mpv-add-item-next"
+        shift
+        ;;
+esac
+
+[ $# -ge 1 ] || usage
+
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# Build one IPC command per item, each on its own line, sent over a single
+# connection - routed through "mpv-add-item"/"mpv-add-item-next" script
+# messages (rather than a raw `loadfile`) so an item already in the running
+# instance's playlist gets ignored, the same way ctrl+v/paste-url ignores
+# one, instead of being added and only cleaned up after the fact. Items are
+# sent in the order given either way - the Lua handler on the receiving end
+# is what keeps -n/--next items in order relative to each other, not this
+# loop.
+#
+# Sent only to playlist_manager: it's the sole handler of these messages
+# (perpetual-playlist, if installed alongside it, only persists/resumes -
+# it has no add-item handling of its own). playlist_manager.lua is
+# therefore required for mpv-add to actually add anything to a running
+# instance.
+COMMANDS=""
+for item in "$@"; do
+    # Strip stray newlines defensively - URLs shouldn't contain them, but a
+    # clipboard/argument mishap must not break the single-line IPC protocol.
+    item=$(printf '%s' "$item" | tr -d '\n\r')
+    escaped=$(json_escape "$item")
+    line=$(printf '{"command": ["script-message-to", "playlist_manager", "%s", "%s", "%s"]}' "$MESSAGE" "$escaped" "$BATCH_ID")
+    COMMANDS="$COMMANDS$line
+"
+done
+
+# Try to talk to a running instance first. `nc -U -z` is unreliable for
+# unix sockets on macOS's BSD nc (returns failure even with a live
+# listener), so we attempt the real send and branch on its exit code
+# instead of doing a separate liveness probe. A dead/absent socket (stale
+# file from a crashed mpv, or no file at all) both surface as the same
+# connect failure, so no special staleness handling is needed - mpv itself
+# removes and recreates the socket file on its next startup.
+if printf '%s' "$COMMANDS" | nc -U -w 1 "$SOCKET" >/dev/null 2>&1; then
+    echo "Sent $# item(s) to running mpv"
+else
+    nohup mpv "$@" >/dev/null 2>&1 &
+    echo "Started new mpv instance with $# item(s)"
+fi
