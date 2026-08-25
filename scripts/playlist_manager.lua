@@ -148,7 +148,7 @@ local function process_fetch_queue()
     fetching[url] = true
     mp.command_native_async({
         name = "subprocess",
-        args = {"yt-dlp", "--no-playlist", "--flat-playlist", "-sJ", "--no-config", url},
+        args = {"yt-dlp", "--no-playlist", "--flat-playlist", "-sJ", url},
         playback_only = false,
         capture_stdout = true,
         capture_stderr = true,
@@ -723,7 +723,7 @@ local function resolve_playlist_entries(item)
 
     local res = mp.command_native({
         name = "subprocess",
-        args = {"yt-dlp", "--no-warnings", "--flat-playlist", "-sJ", "--no-config", item},
+        args = {"yt-dlp", "--no-warnings", "--flat-playlist", "-sJ", item},
         capture_stdout = true,
         capture_stderr = true,
     })
