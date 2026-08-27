@@ -22,20 +22,23 @@ local fetching    = {}
 local fetch_queue = {}
 local fetch_active = false
 
--- Tracks the absolute playlist index for the next "mpv-add-item-next"
--- insert (see the handler below). nil means "no next-batch in progress" -
--- recompute fresh from playlist-pos on the next insert. Reset whenever
--- playlist-pos actually changes (see the observer near the end of this
--- file), so a stale batch never keeps appending after an old position
--- once real navigation has happened.
+-- Tracks the absolute playlist index for the next "mpv-add-item-next" or
+-- "mpv-add-item-play" insert/relocation (see the handlers below - both
+-- share this same state, since either kind of call landing an item
+-- "right after current" should continue from wherever the last one left
+-- off). nil means "no next-batch in progress" - recompute fresh from
+-- playlist-pos on the next insert. Reset whenever playlist-pos actually
+-- changes (see the observer near the end of this file), so a stale batch
+-- never keeps appending after an old position once real navigation has
+-- happened.
 local next_insert_index = nil
 
--- Distinguishes "more items from the same mpv-add -n invocation" (share
--- a batch ID, stay in the order given relative to each other) from "a
--- separate, later mpv-add -n call" (different ID, or none at all - see
--- the handler below), which should always insert right after whatever's
--- currently playing rather than continuing to append after wherever the
--- previous call's items landed.
+-- Distinguishes "more items from the same mpv-remote add invocation"
+-- (share a batch ID, stay in the order given relative to each other)
+-- from "a separate, later mpv-remote add call" (different ID, or none at
+-- all - see the handlers below), which should always insert right after
+-- whatever's currently playing rather than continuing to append after
+-- wherever the previous call's items landed.
 local last_next_batch_id = nil
 
 local overlay           = mp.create_osd_overlay("ass-events")
@@ -753,13 +756,78 @@ local function resolve_playlist_entries(item)
     return #entries > 0 and entries or { item }
 end
 
+-- Used by add_single_item's "play" mode when `item` is already somewhere
+-- in the playlist, rather than silently skipping it (today's dedup
+-- behavior for "last"/"next") or leaving it exactly where it was (which
+-- could be far from "next", making whatever plays after it nonsensical):
+--
+-- - If it's ahead of the current entry (the common case - something
+--   queued for later, now wanted immediately), move it to right after
+--   the current entry, consuming this batch's next insertion slot the
+--   same as a freshly-inserted item would - so whatever was previously
+--   "next" now naturally continues right after it once it finishes.
+-- - If it's at or before the current entry (replaying the current item,
+--   or something already watched), leave history alone and just play it
+--   in place - reordering the past is more surprising than useful, and
+--   no batch slot is consumed since nothing was actually placed there.
+--
+-- Returns the index to hand to playlist-play-index (never nil - item's
+-- presence was already confirmed by the caller's is_in_playlist check).
+local function relocate_for_play(item)
+    local norm = normalize_url(item)
+    local existing_index = nil
+    for i, entry in ipairs(mp.get_property_native("playlist") or {}) do
+        if normalize_url(entry.filename) == norm then
+            existing_index = i - 1 -- playlist indices are 0-based, ipairs is 1-based
+            break
+        end
+    end
+
+    local current_pos = mp.get_property_number("playlist-pos", -1)
+    if current_pos < 0 or existing_index <= current_pos then
+        return existing_index
+    end
+
+    local is_batch_start = next_insert_index == nil
+    if is_batch_start then
+        next_insert_index = current_pos + 1
+    end
+    local target = next_insert_index
+
+    if existing_index ~= target then
+        -- playlist-move's own documented "paradox": moving index1 to
+        -- take index2's place lands the entry AT index2 when index1 >
+        -- index2, but one slot EARLIER (index2 - 1) when index1 < index2
+        -- (removing index1 first shifts index2 back by one before the
+        -- entry lands). existing_index > target always holds here
+        -- (target <= current_pos + 1 <= existing_index by definition,
+        -- and the == case is skipped above), so this always lands
+        -- exactly at `target`.
+        mp.commandv("playlist-move", existing_index, target)
+    end
+    next_insert_index = next_insert_index + 1
+    return target
+end
+
 -- Adds one already-resolved item (never a playlist URL by this point -
--- see resolve_playlist_entries above), either appending to the end or,
--- with next_mode, inserting right after whatever's currently playing.
+-- see resolve_playlist_entries above). `mode` is one of:
+--   "last" - append to the end, starting playback only if idle
+--   "next" - insert right after whatever's currently playing, without
+--            interrupting it
+--   "play" - insert (or relocate, if already present - see
+--            relocate_for_play above) right after whatever's currently
+--            playing, AND force playback to it immediately, interrupting
+--            whatever's currently playing
 -- `quiet` suppresses the per-item toast/redraw, used when the caller is
 -- about to show a single aggregate toast instead (a playlist expanding
--- into many entries shouldn't fire one toast per video). Returns true if
--- the item was actually added, false if it was skipped as a duplicate.
+-- into many entries shouldn't fire one toast per video).
+--
+-- Returns (added, index): `added` is true if the item ended up in the
+-- playlist one way or another (freshly inserted, or an existing
+-- duplicate reused/relocated for "play" mode); `index` is the item's
+-- resulting playlist index, only meaningful for "next"/"play" modes
+-- (used by the mpv-add-item-play handler to know what to hand to
+-- playlist-play-index for the batch's first item) - nil otherwise.
 --
 -- Tries loadlist before loadfile, but ONLY for local paths, never URLs:
 -- loadlist resolves a local directory immediately (same purpose as
@@ -777,57 +845,80 @@ end
 -- function is either a genuine single video, or (rare fallback) a
 -- playlist yt-dlp itself failed to resolve, and either way it must go
 -- through loadfile, not loadlist.
-local function add_single_item(item, next_mode, quiet)
+local function add_single_item(item, mode, quiet)
     if is_in_playlist(item) then
-        if not quiet then show_toast("Already in playlist", false) end
-        return false
+        if mode ~= "play" then
+            if not quiet then show_toast("Already in playlist", false) end
+            return false, nil
+        end
+        local index = relocate_for_play(item)
+        fetch_url_title(item)
+        if not quiet then
+            show_toast("Playing now: " .. item, true)
+            if open then draw_playlist() end
+        end
+        return true, index
     end
 
     local try_loadlist = not is_url(item)
+    local index = nil
 
-    if next_mode then
-        -- Only the very first insert of a fresh batch is allowed to kick
-        -- off playback (*-play) if the player was idle. Using -play for
-        -- every item would race: loadfile/loadlist return before the file
-        -- actually starts loading (per their own docs), so a later insert
-        -- fired moments later can still see "nothing playing yet" and
-        -- hijack playback out from under an earlier item. Plain insert-at
-        -- for the rest sidesteps that race entirely - by then something
-        -- is either already playing, or about to be.
+    if mode == "last" then
+        if not (try_loadlist and mp.commandv("loadlist", item, "append-play")) then
+            mp.commandv("loadfile", item, "append-play")
+        end
+    else -- "next" or "play": both insert right after whatever's currently playing
+        -- Only "next" mode's very first insert of a fresh batch is
+        -- allowed to kick off playback (*-play) if the player was idle.
+        -- Using -play for every item would race: loadfile/loadlist
+        -- return before the file actually starts loading (per their own
+        -- docs), so a later insert fired moments later can still see
+        -- "nothing playing yet" and hijack playback out from under an
+        -- earlier item. Plain insert-at for the rest sidesteps that race
+        -- entirely - by then something is either already playing, or
+        -- about to be. "play" mode never uses the -play variant at all:
+        -- it always forces an explicit playlist-play-index afterward
+        -- (see the mpv-add-item-play handler) regardless of idle state,
+        -- so starting playback here too would be redundant at best and
+        -- racy at worst.
         local is_batch_start = next_insert_index == nil
         if is_batch_start then
             local pos = mp.get_property_number("playlist-pos", -1)
             next_insert_index = (pos >= 0) and (pos + 1) or 0
         end
 
-        local flag = is_batch_start and "insert-at-play" or "insert-at"
-        local index = tostring(next_insert_index)
-        if not (try_loadlist and mp.commandv("loadlist", item, flag, index)) then
-            mp.commandv("loadfile", item, flag, index)
+        local flag
+        if mode == "next" then
+            flag = is_batch_start and "insert-at-play" or "insert-at"
+        else
+            flag = "insert-at"
+        end
+        index = next_insert_index
+        if not (try_loadlist and mp.commandv("loadlist", item, flag, tostring(index))) then
+            mp.commandv("loadfile", item, flag, tostring(index))
         end
         next_insert_index = next_insert_index + 1
-    else
-        if not (try_loadlist and mp.commandv("loadlist", item, "append-play")) then
-            mp.commandv("loadfile", item, "append-play")
-        end
     end
 
     fetch_url_title(item)
 
     if not quiet then
-        show_toast((next_mode and "Added next: " or "Added: ") .. item, true)
+        local verb = "Added: "
+        if mode == "next" then verb = "Added next: "
+        elseif mode == "play" then verb = "Playing now: " end
+        show_toast(verb .. item, true)
         if open then draw_playlist() end
     end
 
-    return true
+    return true, index
 end
 
--- Entry point for plugins/perpetual-playlist/bin/mpv-add, sent over the
--- IPC socket as `script-message-to playlist_manager mpv-add-item <item>`
--- instead of a raw `loadfile` - so an item that's already in the running
--- instance's playlist gets ignored the same way ctrl+v/paste-url ignores
--- one, instead of briefly being added and only cleaned up after the fact
--- by dedup_playlist() below. A playlist URL or directory is pre-resolved
+-- Entry point for `mpv-remote add last`, sent over the IPC socket as
+-- `script-message-to playlist_manager mpv-add-item <item>` instead of a
+-- raw `loadfile` - so an item that's already in the running instance's
+-- playlist gets ignored the same way ctrl+v/paste-url ignores one,
+-- instead of briefly being added and only cleaned up after the fact by
+-- dedup_playlist() below. A playlist URL or directory is pre-resolved
 -- into its individual entries first (see resolve_playlist_entries), so
 -- they all show up immediately instead of one inert placeholder.
 mp.register_script_message("mpv-add-item", function(item)
@@ -835,13 +926,13 @@ mp.register_script_message("mpv-add-item", function(item)
 
     local entries = resolve_playlist_entries(item)
     if #entries == 1 then
-        add_single_item(entries[1], false, false)
+        add_single_item(entries[1], "last", false)
         return
     end
 
     local added = 0
     for _, entry in ipairs(entries) do
-        if add_single_item(entry, false, true) then
+        if add_single_item(entry, "last", true) then
             added = added + 1
         end
     end
@@ -849,22 +940,25 @@ mp.register_script_message("mpv-add-item", function(item)
     if open then draw_playlist() end
 end)
 
--- Entry point for `mpv-add -n`/`--next` - see mpv-add-item above for the
+-- Entry point for `mpv-remote add next` - see mpv-add-item above for the
 -- playlist/directory pre-resolution and the toast-batching rationale, and
 -- add_single_item for the absolute-index insertion logic (inserting right
 -- after whatever's currently playing instead of appending to the end,
 -- preserving order across multiple items - including every entry of an
 -- expanded playlist - via next_insert_index).
 --
--- batch_id (mpv-add's own PID, or empty/missing for anything else that
+-- batch_id (mpv-remote's own PID, or empty/missing for anything else that
 -- might send this message by hand) distinguishes multiple items from the
--- *same* mpv-add -n invocation, which should stay in the order given
+-- *same* mpv-remote add invocation, which should stay in the order given
 -- relative to each other (next_insert_index left alone - it's mid-batch),
 -- from a separate, later invocation, which should always land right
 -- after whatever's currently playing rather than continuing to append
 -- after wherever the previous call's items ended up. A missing/empty
 -- batch_id always counts as "new" (the safer default), so this only ever
 -- suppresses a reset when there's positive evidence it's a continuation.
+-- Shared with mpv-add-item-play below - either kind of call landing an
+-- item "right after current" continues from wherever the last one left
+-- off, regardless of which of the two messages sent it.
 mp.register_script_message("mpv-add-item-next", function(item, batch_id)
     if not item or item == "" then return end
 
@@ -875,16 +969,76 @@ mp.register_script_message("mpv-add-item-next", function(item, batch_id)
 
     local entries = resolve_playlist_entries(item)
     if #entries == 1 then
-        add_single_item(entries[1], true, false)
+        add_single_item(entries[1], "next", false)
         return
     end
 
     local added = 0
     for _, entry in ipairs(entries) do
-        if add_single_item(entry, true, true) then
+        if add_single_item(entry, "next", true) then
             added = added + 1
         end
     end
     show_toast("Added " .. added .. " item(s) next from playlist", true)
     if open then draw_playlist() end
+end)
+
+-- Entry point for `mpv-remote add` (bare, no next/last keyword) - "play
+-- now". See mpv-add-item above for the playlist/directory pre-resolution
+-- and toast-batching rationale, mpv-add-item-next for the batch_id/
+-- next_insert_index mechanics (shared with this handler), and
+-- add_single_item/relocate_for_play for exactly how an item ends up
+-- positioned.
+--
+-- The key difference from mpv-add-item-next: once every given item has
+-- been inserted (or, for a duplicate, relocated - see relocate_for_play),
+-- the FIRST item given is forced to start playing immediately via
+-- playlist-play-index, interrupting whatever's currently playing -
+-- insert-at-play only starts playback if the player was idle, which
+-- isn't enough here. Only the first item's index is used for this; the
+-- rest just land in their batch-assigned slots in order, exactly like
+-- mpv-add-item-next, and play out naturally once the first one ends.
+mp.register_script_message("mpv-add-item-play", function(item, batch_id)
+    if not item or item == "" then return end
+
+    if not batch_id or batch_id == "" or batch_id ~= last_next_batch_id then
+        next_insert_index = nil
+        last_next_batch_id = batch_id
+    end
+
+    -- Only the very first script-message of a fresh batch is allowed to
+    -- force playback via playlist-play-index below - mpv-remote's `add`
+    -- sends one separate message per URL given on the command line, so
+    -- with more than one URL this handler runs once per URL, not once
+    -- for the whole batch. Without this guard, EVERY invocation would
+    -- compute its own "first entry" and re-fire playlist-play-index,
+    -- and since they arrive as sequential IPC messages, the LAST URL
+    -- given would always win and hijack playback away from the actual
+    -- first item the user asked to play. next_insert_index being nil
+    -- here (before add_single_item touches it below) is exactly "no
+    -- item from this batch has claimed a slot yet" - the same signal
+    -- add_single_item itself uses internally for is_batch_start.
+    local is_first_of_batch = next_insert_index == nil
+
+    local entries = resolve_playlist_entries(item)
+    local quiet_each = #entries > 1
+    local first_index = nil
+    local added = 0
+
+    for i, entry in ipairs(entries) do
+        local ok, index = add_single_item(entry, "play", quiet_each)
+        if ok then
+            added = added + 1
+            if i == 1 then first_index = index end
+        end
+    end
+
+    if is_first_of_batch and first_index then
+        mp.commandv("playlist-play-index", tostring(first_index))
+    end
+
+    if quiet_each then
+        show_toast("Playing " .. added .. " item(s) from playlist", true)
+        if open then draw_playlist() end
+    end
 end)
