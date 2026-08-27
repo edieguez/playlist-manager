@@ -30,7 +30,13 @@ subcommand), and automatic YouTube-playlist-URL expansion.
   and jumps playback to it, rather than silently doing nothing.
 - **Background title resolution.** URL entries in the dialog show a
   human-readable title (via `yt-dlp`) instead of the raw URL, when
-  `resolve_url_titles=yes` (the default).
+  `resolve_url_titles=yes` (the default). Resolved titles are cached to
+  `~/.local/state/mpv/playlist_manager_titles.json` (path not
+  configurable) so they survive restarts - a video resolved once never
+  pays the `yt-dlp` startup + network round-trip again. Entirely
+  self-contained: this cache is this plugin's own, not delegated to
+  perpetual-playlist or anything else, so it works whether or not any
+  other plugin is installed.
 - **Passive dedup safety net.** Runs a dedup pass any time the playlist
   count rises, regardless of how the item got there (CLI args, external
   IPC, another script), catching anything the pre-add checks above didn't.
@@ -59,14 +65,17 @@ See `script-opts/playlist_manager.conf` for the one option:
 
 ## Interop with perpetual-playlist
 
-This plugin operates purely on mpv's live in-memory playlist - it doesn't
-persist anything to disk. If installed alongside
+This plugin operates on mpv's live in-memory playlist - the only thing it
+persists to disk of its own is the title cache above, not the playlist
+itself. If installed alongside
 [perpetual-playlist](https://github.com/edieguez/perpetual-playlist), that
 sibling plugin transparently saves/resumes whatever this plugin (or
-anything else) puts into the playlist, across mpv restarts. Neither plugin
-requires the other, but `mpv-remote add`'s fresh-instance fallback plays
-more nicely with perpetual-playlist installed (cold-start items get
-spliced into the resumed playlist instead of simply replacing it).
+anything else) puts into the playlist, across mpv restarts. Neither
+plugin requires the other or depends on the other's persisted state -
+each caches/saves its own data independently, in its own file - but
+`mpv-remote add`'s fresh-instance fallback plays more nicely with
+perpetual-playlist installed (cold-start items get spliced into the
+resumed playlist instead of simply replacing it).
 
 ## License
 

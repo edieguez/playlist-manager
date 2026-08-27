@@ -22,6 +22,57 @@ local fetching    = {}
 local fetch_queue = {}
 local fetch_active = false
 
+-- Persists resolved titles across mpv restarts, so a video already
+-- resolved in a previous session doesn't re-pay yt-dlp startup + a
+-- network round-trip just because this session's in-memory title_cache
+-- starts empty. Deliberately hardcoded, not a script-opt - nothing here
+-- needs to be user-configurable. Lives in this file rather than
+-- perpetual-playlist's own persisted state (a different file, a
+-- different concern - the playlist itself) precisely so neither plugin
+-- depends on the other being installed for its own feature to work.
+local title_cache_file = mp.command_native({"expand-path", "~/.local/state/mpv/playlist_manager_titles.json"})
+
+local function load_title_cache()
+    local f = io.open(title_cache_file, "r")
+    if not f then return end
+    local content = f:read("*a")
+    f:close()
+
+    local ok, parsed = pcall(utils.parse_json, content)
+    if ok and type(parsed) == "table" then
+        title_cache = parsed
+    end
+end
+load_title_cache()
+
+local function save_title_cache()
+    local f = io.open(title_cache_file, "w")
+    if not f then
+        -- io.open(path, "w") does not create missing parent directories
+        -- on its own - only the file itself, and only if the directory
+        -- is already there. Without this fallback, a fresh install/
+        -- machine where that directory doesn't yet exist would make
+        -- every save silently no-op forever. Only shell out to mkdir -p
+        -- here, in this rare fallback path (once, on actual write
+        -- failure), not proactively on every script load.
+        pcall(function()
+            local dir = utils.split_path(title_cache_file) -- split_path returns (dir, filename); only dir wanted here
+            mp.command_native({
+                name = "subprocess",
+                args = { "mkdir", "-p", dir },
+                playback_only = false,
+                capture_stdout = false,
+                capture_stderr = false,
+            })
+        end)
+        f = io.open(title_cache_file, "w")
+    end
+    if f then
+        f:write(utils.format_json(title_cache))
+        f:close()
+    end
+end
+
 -- Tracks the absolute playlist index for the next "mpv-add-item-next" or
 -- "mpv-add-item-play" insert/relocation (see the handlers below - both
 -- share this same state, since either kind of call landing an item
@@ -162,6 +213,7 @@ local function process_fetch_queue()
             local json = utils.parse_json(res.stdout)
             if json and json.title then
                 title_cache[url] = json.title
+                save_title_cache()
                 if open then draw_playlist() end
             end
         else
@@ -741,6 +793,7 @@ local function resolve_playlist_entries(item)
     end
 
     local entries = {}
+    local seeded_any = false
     for _, entry in ipairs(data.entries) do
         if entry.url then
             if entry.title then
@@ -748,10 +801,14 @@ local function resolve_playlist_entries(item)
                 -- fetch_url_title() below is a no-op for these instead of
                 -- firing a redundant yt-dlp call per expanded entry.
                 title_cache[normalize_url(entry.url)] = entry.title
+                seeded_any = true
             end
             table.insert(entries, entry.url)
         end
     end
+    -- One save for the whole expansion, not one per entry - a single
+    -- playlist URL can expand into dozens of entries at once.
+    if seeded_any then save_title_cache() end
 
     return #entries > 0 and entries or { item }
 end
