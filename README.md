@@ -16,17 +16,18 @@ subcommand), and automatic YouTube-playlist-URL expansion.
 - **Adding items.** `ctrl+v` pastes a clipboard URL/path and appends it to
   the playlist. `mpv-remote add` (see [its README](https://github.com/edieguez/mpv-remote))
   does the same from outside mpv, over IPC, in three modes - bare (play
-  now), `next` (insert after current), `last` (append to end) - this
-  plugin is the sole handler of the `mpv-add-item`/`mpv-add-item-next`/
-  `mpv-add-item-play` messages it sends. All funnel through the same core
-  add logic: a plain YouTube watch URL is never accidentally expanded
-  into its autoplay "up next" mix, and an actual YouTube *playlist* URL
-  is expanded via `yt-dlp` into its individual videos. Duplicate items
-  are rejected (with an "Already in playlist" toast for the clipboard/
-  manual/`next`/`last` cases) - except for `mpv-remote add`'s bare "play
-  now" mode, which instead relocates the existing entry to right after
-  the current item (if it's ahead of it) and jumps playback to it,
-  rather than silently doing nothing.
+  now, taking the current item's own slot and interrupting it), `next`
+  (insert after current, without interrupting it), `last` (append to
+  end) - this plugin is the sole handler of the `mpv-add-item`/
+  `mpv-add-item-next`/`mpv-add-item-play` messages it sends. All funnel
+  through the same core add logic: a plain YouTube watch URL is never
+  accidentally expanded into its autoplay "up next" mix, and an actual
+  YouTube *playlist* URL is expanded via `yt-dlp` into its individual
+  videos. Duplicate items are rejected (with an "Already in playlist"
+  toast for the clipboard/manual/`next`/`last` cases) - except for
+  `mpv-remote add`'s bare "play now" mode, which instead relocates the
+  existing entry to take the current item's slot (if it's ahead of it)
+  and jumps playback to it, rather than silently doing nothing.
 - **Background title resolution.** URL entries in the dialog show a
   human-readable title (via `yt-dlp`) instead of the raw URL, when
   `resolve_url_titles=yes` (the default).

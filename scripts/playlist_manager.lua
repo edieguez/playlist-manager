@@ -759,13 +759,18 @@ end
 -- Used by add_single_item's "play" mode when `item` is already somewhere
 -- in the playlist, rather than silently skipping it (today's dedup
 -- behavior for "last"/"next") or leaving it exactly where it was (which
--- could be far from "next", making whatever plays after it nonsensical):
+-- could be far from the current entry, making whatever plays after it
+-- nonsensical):
 --
 -- - If it's ahead of the current entry (the common case - something
---   queued for later, now wanted immediately), move it to right after
---   the current entry, consuming this batch's next insertion slot the
---   same as a freshly-inserted item would - so whatever was previously
---   "next" now naturally continues right after it once it finishes.
+--   queued for later, now wanted immediately), move it to take the
+--   current entry's own slot - pushing the current entry (and
+--   everything after it) one slot later, unchanged relative order -
+--   consuming this batch's next insertion slot the same as a
+--   freshly-inserted item would. Once this (and any other batch items)
+--   finish playing, the interrupted current entry naturally plays next,
+--   and the playlist continues exactly as it would have otherwise -
+--   nothing is skipped or orphaned by the interruption.
 -- - If it's at or before the current entry (replaying the current item,
 --   or something already watched), leave history alone and just play it
 --   in place - reordering the past is more surprising than useful, and
@@ -790,7 +795,7 @@ local function relocate_for_play(item)
 
     local is_batch_start = next_insert_index == nil
     if is_batch_start then
-        next_insert_index = current_pos + 1
+        next_insert_index = current_pos
     end
     local target = next_insert_index
 
@@ -800,9 +805,9 @@ local function relocate_for_play(item)
         -- index2, but one slot EARLIER (index2 - 1) when index1 < index2
         -- (removing index1 first shifts index2 back by one before the
         -- entry lands). existing_index > target always holds here
-        -- (target <= current_pos + 1 <= existing_index by definition,
-        -- and the == case is skipped above), so this always lands
-        -- exactly at `target`.
+        -- (target <= current_pos < existing_index by definition, and the
+        -- == case is skipped above), so this always lands exactly at
+        -- `target`.
         mp.commandv("playlist-move", existing_index, target)
     end
     next_insert_index = next_insert_index + 1
@@ -815,9 +820,13 @@ end
 --   "next" - insert right after whatever's currently playing, without
 --            interrupting it
 --   "play" - insert (or relocate, if already present - see
---            relocate_for_play above) right after whatever's currently
---            playing, AND force playback to it immediately, interrupting
---            whatever's currently playing
+--            relocate_for_play above) right BEFORE whatever's currently
+--            playing - taking its slot and pushing it (and everything
+--            after it) one later - then force playback to the new item
+--            immediately, interrupting whatever's currently playing.
+--            Once the new item(s) finish, the interrupted entry plays
+--            next and the playlist carries on exactly as it would have
+--            otherwise, instead of skipping straight past it.
 -- `quiet` suppresses the per-item toast/redraw, used when the caller is
 -- about to show a single aggregate toast instead (a playlist expanding
 -- into many entries shouldn't fire one toast per video).
@@ -867,7 +876,7 @@ local function add_single_item(item, mode, quiet)
         if not (try_loadlist and mp.commandv("loadlist", item, "append-play")) then
             mp.commandv("loadfile", item, "append-play")
         end
-    else -- "next" or "play": both insert right after whatever's currently playing
+    else -- "next" or "play"
         -- Only "next" mode's very first insert of a fresh batch is
         -- allowed to kick off playback (*-play) if the player was idle.
         -- Using -play for every item would race: loadfile/loadlist
@@ -881,10 +890,26 @@ local function add_single_item(item, mode, quiet)
         -- (see the mpv-add-item-play handler) regardless of idle state,
         -- so starting playback here too would be redundant at best and
         -- racy at worst.
+        --
+        -- The anchor itself differs by mode: "next" inserts AFTER the
+        -- current entry (pos + 1), leaving it alone and still playing.
+        -- "play" inserts AT the current entry's own slot (pos), pushing
+        -- it (and everything after it) one later instead - so once the
+        -- new item(s) finish, the interrupted entry plays next and the
+        -- playlist carries on exactly as it would have otherwise. If
+        -- nothing is playing at all (idle), there's no current entry to
+        -- insert before or after, so both modes just insert at the
+        -- front.
         local is_batch_start = next_insert_index == nil
         if is_batch_start then
             local pos = mp.get_property_number("playlist-pos", -1)
-            next_insert_index = (pos >= 0) and (pos + 1) or 0
+            if pos < 0 then
+                next_insert_index = 0
+            elseif mode == "play" then
+                next_insert_index = pos
+            else
+                next_insert_index = pos + 1
+            end
         end
 
         local flag
