@@ -126,7 +126,7 @@ local LH          = FONT_SIZE * 1.2
 -- Full-height fill (mirroring console.lua's calculate_max_lines()) leaves too little
 -- breathing room for a media-player overlay when the playlist is long, so cap it at a
 -- size that still shows a solid number of rows without dominating the screen.
-local MAX_VISIBLE = math.min(math.floor((720 - PAD * 2) / LH - 1.5), 14)
+local MAX_VISIBLE = math.min(math.floor((720 - PAD * 2) / LH - 1.5), 12)
 
 -- Returns the virtual canvas width that keeps pixels square for the current display
 --   res_y = 720 (fixed), res_x = 720 * display_aspect (dynamic).
