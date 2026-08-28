@@ -118,7 +118,10 @@ local BG_ALPHA    = 0x50   -- background_alpha = 80 = 0x50 in the select script
 local CORNER      = 8
 local PAD         = 10
 local LH          = FONT_SIZE * 1.2
-local MAX_VISIBLE = 12
+-- Full-height fill (mirroring console.lua's calculate_max_lines()) leaves too little
+-- breathing room for a media-player overlay when the playlist is long, so cap it at a
+-- size that still shows a solid number of rows without dominating the screen.
+local MAX_VISIBLE = math.min(math.floor((720 - PAD * 2) / LH - 1.5), 14)
 
 -- Returns the virtual canvas width that keeps pixels square for the current display
 --   res_y = 720 (fixed), res_x = 720 * display_aspect (dynamic).
@@ -467,6 +470,17 @@ draw_playlist = function()
         ass:draw_start()
         ass:rect_cw(0, 0, 3, bar_h)
         ass:draw_stop()
+    end
+
+    -- ── Counter ──────────────────────────────────────────────────────────────
+    -- Item counter (current/total), top-right of the box. Always shown, regardless
+    -- of whether the list is currently scrollable.
+    if n > 0 then
+        ass:new_event()
+        ass:an(9)
+        ass:pos(x + cw, y)
+        ass:append(("{\\bord1\\1c&HFFFFFF&\\3c&H000000&\\fs%d\\fsp0\\q2}"):format(FONT_SIZE))
+        ass:append((cursor + 1) .. "/" .. n)
     end
 
     overlay.res_x = W
