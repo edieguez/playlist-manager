@@ -22,6 +22,11 @@ local fetching    = {}
 local fetch_queue = {}
 local fetch_active = false
 
+-- Serializes the mpv-add-item* handlers so items are resolved and inserted
+-- one at a time, in arrival order - see process_add_queue below.
+local add_queue  = {}
+local add_active = false
+
 -- Persists resolved titles across mpv restarts, so a video already
 -- resolved in a previous session doesn't re-pay yt-dlp startup + a
 -- network round-trip just because this session's in-memory title_cache
@@ -764,12 +769,12 @@ mp.add_key_binding("ctrl+v", "paste-url", function()
     if open then draw_playlist() end
 end)
 
--- Runs yt-dlp synchronously to check whether `item` is actually a
--- playlist (a directory or channel/playlist URL that expands into many
--- videos) rather than a single video. Only meaningful for URLs - local
--- files/directories are returned unchanged here and handled directly in
--- add_single_item() via loadlist instead, which resolves a local
--- directory without needing yt-dlp at all.
+-- Runs yt-dlp to check whether `item` is actually a playlist (a directory
+-- or channel/playlist URL that expands into many videos) rather than a
+-- single video. Only meaningful for URLs - local files/directories are
+-- returned unchanged here and handled directly in add_single_item() via
+-- loadlist instead, which resolves a local directory without needing
+-- yt-dlp at all.
 --
 -- mpv's own loadfile only resolves a playlist URL lazily - only once mpv
 -- actually gets around to playing that specific entry - so a playlist
@@ -778,53 +783,83 @@ end)
 -- is lost, but it looks broken and can stay that way indefinitely.
 -- Pre-resolving here instead makes it expand immediately.
 --
--- Blocking: adds yt-dlp startup + a network round-trip (roughly half a
--- second to a couple of seconds) to every URL add, not just playlists -
--- an accepted tradeoff for correct, immediate, correctly-ordered
--- expansion. Any failure (non-zero exit, unparseable JSON, not actually a
--- playlist) falls back to returning the item unchanged, so a single
--- video, an unsupported site, or a transient network hiccup degrade to
--- today's lazy-loadfile behavior rather than blocking the add.
-local function resolve_playlist_entries(item)
+-- Async (mp.command_native_async, not the blocking mp.command_native): a
+-- synchronous subprocess call here used to freeze mpv's whole script
+-- thread - OSD, dialog, input, everything - for yt-dlp's startup + a
+-- network round-trip on every URL add, compounding badly across a
+-- multi-item batch. Callers must serialize their own calls (see
+-- process_add_queue below) if they need results in a stable order. Any
+-- failure (non-zero exit, unparseable JSON, not actually a playlist)
+-- calls back with the item unchanged, so a single video, an unsupported
+-- site, or a transient network hiccup degrade to today's lazy-loadfile
+-- behavior rather than blocking the add.
+local function resolve_playlist_entries_async(item, callback)
     if not is_url(item) then
-        return { item }
+        callback({ item })
+        return
     end
 
-    local res = mp.command_native({
+    mp.command_native_async({
         name = "subprocess",
         args = {"yt-dlp", "--no-warnings", "--flat-playlist", "-sJ", item},
         capture_stdout = true,
         capture_stderr = true,
-    })
-    if not res or res.status ~= 0 or not res.stdout or res.stdout == "" then
-        return { item }
-    end
-
-    local ok, data = pcall(utils.parse_json, res.stdout)
-    if not ok or type(data) ~= "table" or data._type ~= "playlist"
-       or type(data.entries) ~= "table" or #data.entries == 0 then
-        return { item }
-    end
-
-    local entries = {}
-    local seeded_any = false
-    for _, entry in ipairs(data.entries) do
-        if entry.url then
-            if entry.title then
-                -- Seeds the title cache from data we already have, so
-                -- fetch_url_title() below is a no-op for these instead of
-                -- firing a redundant yt-dlp call per expanded entry.
-                title_cache[normalize_url(entry.url)] = entry.title
-                seeded_any = true
-            end
-            table.insert(entries, entry.url)
+    }, function(_, res)
+        if not res or res.status ~= 0 or not res.stdout or res.stdout == "" then
+            callback({ item })
+            return
         end
-    end
-    -- One save for the whole expansion, not one per entry - a single
-    -- playlist URL can expand into dozens of entries at once.
-    if seeded_any then save_title_cache() end
 
-    return #entries > 0 and entries or { item }
+        local ok, data = pcall(utils.parse_json, res.stdout)
+        if not ok or type(data) ~= "table" or data._type ~= "playlist"
+           or type(data.entries) ~= "table" or #data.entries == 0 then
+            callback({ item })
+            return
+        end
+
+        local entries = {}
+        local seeded_any = false
+        for _, entry in ipairs(data.entries) do
+            if entry.url then
+                if entry.title then
+                    -- Seeds the title cache from data we already have, so
+                    -- fetch_url_title() below is a no-op for these instead of
+                    -- firing a redundant yt-dlp call per expanded entry.
+                    title_cache[normalize_url(entry.url)] = entry.title
+                    seeded_any = true
+                end
+                table.insert(entries, entry.url)
+            end
+        end
+        -- One save for the whole expansion, not one per entry - a single
+        -- playlist URL can expand into dozens of entries at once.
+        if seeded_any then save_title_cache() end
+
+        callback(#entries > 0 and entries or { item })
+    end)
+end
+
+-- Serializes the mpv-add-item* handlers below so items are resolved and
+-- inserted strictly in arrival order, one at a time - same one-job-at-a-
+-- time shape as process_fetch_queue/fetch_active above, needed here so
+-- next_insert_index/last_next_batch_id (shared across all three handlers)
+-- are only ever touched by one in-flight job at once. `job` is a
+-- function(done) that must call done() exactly once when it has fully
+-- finished (including all its add_single_item calls), so the queue can
+-- move on to the next one.
+local function process_add_queue()
+    if add_active or #add_queue == 0 then return end
+    add_active = true
+    local job = table.remove(add_queue, 1)
+    job(function()
+        add_active = false
+        process_add_queue()
+    end)
+end
+
+local function enqueue_add(job)
+    add_queue[#add_queue + 1] = job
+    process_add_queue()
 end
 
 -- Used by add_single_item's "play" mode when `item` is already somewhere
@@ -886,7 +921,7 @@ local function relocate_for_play(item)
 end
 
 -- Adds one already-resolved item (never a playlist URL by this point -
--- see resolve_playlist_entries above). `mode` is one of:
+-- see resolve_playlist_entries_async above). `mode` is one of:
 --   "last" - append to the end, starting playback only if idle
 --   "next" - insert right after whatever's currently playing, without
 --            interrupting it
@@ -921,7 +956,7 @@ end
 -- "succeeds" by pulling in YouTube's autoplay/"up next" mix as a giant
 -- playlist (83 unrelated videos in testing, for a single watch URL).
 -- Playlist URLs are already handled correctly ahead of this, by
--- resolve_playlist_entries's yt-dlp pre-expansion - any URL reaching this
+-- resolve_playlist_entries_async's yt-dlp pre-expansion - any URL reaching this
 -- function is either a genuine single video, or (rare fallback) a
 -- playlist yt-dlp itself failed to resolve, and either way it must go
 -- through loadfile, not loadlist.
@@ -1015,25 +1050,34 @@ end
 -- playlist gets ignored the same way ctrl+v/paste-url ignores one,
 -- instead of briefly being added and only cleaned up after the fact by
 -- dedup_playlist() below. A playlist URL or directory is pre-resolved
--- into its individual entries first (see resolve_playlist_entries), so
--- they all show up immediately instead of one inert placeholder.
+-- into its individual entries first (see resolve_playlist_entries_async),
+-- so they all show up immediately instead of one inert placeholder.
+--
+-- Runs as a queued job (see process_add_queue/enqueue_add above) rather
+-- than inline, since resolve_playlist_entries_async is async - queueing
+-- keeps multiple items landing in the playlist in arrival order without
+-- blocking the dialog/player while each one resolves.
 mp.register_script_message("mpv-add-item", function(item)
     if not item or item == "" then return end
+    enqueue_add(function(done)
+        resolve_playlist_entries_async(item, function(entries)
+            if #entries == 1 then
+                add_single_item(entries[1], "last", false)
+                done()
+                return
+            end
 
-    local entries = resolve_playlist_entries(item)
-    if #entries == 1 then
-        add_single_item(entries[1], "last", false)
-        return
-    end
-
-    local added = 0
-    for _, entry in ipairs(entries) do
-        if add_single_item(entry, "last", true) then
-            added = added + 1
-        end
-    end
-    show_toast("Added " .. added .. " item(s) from playlist", true)
-    if open then draw_playlist() end
+            local added = 0
+            for _, entry in ipairs(entries) do
+                if add_single_item(entry, "last", true) then
+                    added = added + 1
+                end
+            end
+            show_toast("Added " .. added .. " item(s) from playlist", true)
+            if open then draw_playlist() end
+            done()
+        end)
+    end)
 end)
 
 -- Entry point for `mpv-remote add next` - see mpv-add-item above for the
@@ -1055,28 +1099,38 @@ end)
 -- Shared with mpv-add-item-play below - either kind of call landing an
 -- item "right after current" continues from wherever the last one left
 -- off, regardless of which of the two messages sent it.
+-- Runs as a queued job, same rationale as mpv-add-item above. The
+-- batch_id/next_insert_index check below runs when the job actually
+-- executes (i.e. when its turn in the queue comes up), not when the
+-- message arrives - an earlier item from the same batch may still be
+-- queued/resolving, and only once it has actually run does
+-- next_insert_index reflect the batch's true state.
 mp.register_script_message("mpv-add-item-next", function(item, batch_id)
     if not item or item == "" then return end
-
-    if not batch_id or batch_id == "" or batch_id ~= last_next_batch_id then
-        next_insert_index = nil
-        last_next_batch_id = batch_id
-    end
-
-    local entries = resolve_playlist_entries(item)
-    if #entries == 1 then
-        add_single_item(entries[1], "next", false)
-        return
-    end
-
-    local added = 0
-    for _, entry in ipairs(entries) do
-        if add_single_item(entry, "next", true) then
-            added = added + 1
+    enqueue_add(function(done)
+        if not batch_id or batch_id == "" or batch_id ~= last_next_batch_id then
+            next_insert_index = nil
+            last_next_batch_id = batch_id
         end
-    end
-    show_toast("Added " .. added .. " item(s) next from playlist", true)
-    if open then draw_playlist() end
+
+        resolve_playlist_entries_async(item, function(entries)
+            if #entries == 1 then
+                add_single_item(entries[1], "next", false)
+                done()
+                return
+            end
+
+            local added = 0
+            for _, entry in ipairs(entries) do
+                if add_single_item(entry, "next", true) then
+                    added = added + 1
+                end
+            end
+            show_toast("Added " .. added .. " item(s) next from playlist", true)
+            if open then draw_playlist() end
+            done()
+        end)
+    end)
 end)
 
 -- Entry point for `mpv-remote add` (bare, no next/last keyword) - "play
@@ -1094,47 +1148,54 @@ end)
 -- isn't enough here. Only the first item's index is used for this; the
 -- rest just land in their batch-assigned slots in order, exactly like
 -- mpv-add-item-next, and play out naturally once the first one ends.
+-- Runs as a queued job, same rationale as mpv-add-item/mpv-add-item-next
+-- above.
 mp.register_script_message("mpv-add-item-play", function(item, batch_id)
     if not item or item == "" then return end
-
-    if not batch_id or batch_id == "" or batch_id ~= last_next_batch_id then
-        next_insert_index = nil
-        last_next_batch_id = batch_id
-    end
-
-    -- Only the very first script-message of a fresh batch is allowed to
-    -- force playback via playlist-play-index below - mpv-remote's `add`
-    -- sends one separate message per URL given on the command line, so
-    -- with more than one URL this handler runs once per URL, not once
-    -- for the whole batch. Without this guard, EVERY invocation would
-    -- compute its own "first entry" and re-fire playlist-play-index,
-    -- and since they arrive as sequential IPC messages, the LAST URL
-    -- given would always win and hijack playback away from the actual
-    -- first item the user asked to play. next_insert_index being nil
-    -- here (before add_single_item touches it below) is exactly "no
-    -- item from this batch has claimed a slot yet" - the same signal
-    -- add_single_item itself uses internally for is_batch_start.
-    local is_first_of_batch = next_insert_index == nil
-
-    local entries = resolve_playlist_entries(item)
-    local quiet_each = #entries > 1
-    local first_index = nil
-    local added = 0
-
-    for i, entry in ipairs(entries) do
-        local ok, index = add_single_item(entry, "play", quiet_each)
-        if ok then
-            added = added + 1
-            if i == 1 then first_index = index end
+    enqueue_add(function(done)
+        if not batch_id or batch_id == "" or batch_id ~= last_next_batch_id then
+            next_insert_index = nil
+            last_next_batch_id = batch_id
         end
-    end
 
-    if is_first_of_batch and first_index then
-        mp.commandv("playlist-play-index", tostring(first_index))
-    end
+        -- Only the very first job of a fresh batch is allowed to force
+        -- playback via playlist-play-index below - mpv-remote's `add`
+        -- sends one separate message per URL given on the command line,
+        -- so with more than one URL this handler runs once per URL, not
+        -- once for the whole batch. Without this guard, EVERY invocation
+        -- would compute its own "first entry" and re-fire
+        -- playlist-play-index, and since jobs run in arrival order, the
+        -- LAST URL given would always win and hijack playback away from
+        -- the actual first item the user asked to play.
+        -- next_insert_index being nil here - checked now, when this job
+        -- actually starts running, not when its message arrived - is
+        -- exactly "no item from this batch has claimed a slot yet", the
+        -- same signal add_single_item itself uses internally for
+        -- is_batch_start.
+        local is_first_of_batch = next_insert_index == nil
 
-    if quiet_each then
-        show_toast("Playing " .. added .. " item(s) from playlist", true)
-        if open then draw_playlist() end
-    end
+        resolve_playlist_entries_async(item, function(entries)
+            local quiet_each = #entries > 1
+            local first_index = nil
+            local added = 0
+
+            for i, entry in ipairs(entries) do
+                local ok, index = add_single_item(entry, "play", quiet_each)
+                if ok then
+                    added = added + 1
+                    if i == 1 then first_index = index end
+                end
+            end
+
+            if is_first_of_batch and first_index then
+                mp.commandv("playlist-play-index", tostring(first_index))
+            end
+
+            if quiet_each then
+                show_toast("Playing " .. added .. " item(s) from playlist", true)
+                if open then draw_playlist() end
+            end
+            done()
+        end)
+    end)
 end)
