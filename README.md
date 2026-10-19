@@ -63,6 +63,17 @@ See `script-opts/playlist_manager.conf` for the one option:
 `resolve_url_titles` (default `yes`) - set to `no` to skip background
 `yt-dlp` title fetches (faster, titles show as raw URLs instead).
 
+## Interop with ytdl-prefetch
+
+While the playlist dialog's reordering ("moving") mode is active, this
+plugin sends `ytdl-prefetch-suspend`/`ytdl-prefetch-resume` script-messages
+to [ytdl-prefetch](https://github.com/edieguez/ytdl-prefetch) (if
+installed), followed by `ytdl-prefetch-now` on commit/cancel, so its
+background neighbor-prefetching doesn't fire once per UP/DOWN keystroke
+while an item is being moved past several others - only once, for
+wherever it actually ends up, when the move is committed (`ENTER`/`LEFT`/
+`ctrl+h`) or cancelled (`ESC`). A no-op if ytdl-prefetch isn't installed.
+
 ## Interop with perpetual-playlist
 
 This plugin operates on mpv's live in-memory playlist - the only thing it

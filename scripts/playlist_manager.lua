@@ -628,6 +628,8 @@ local function show_playlist_selector()
     local function do_enter()
         if moving then
             moving = false
+            mp.commandv("script-message", "ytdl-prefetch-resume")
+            mp.commandv("script-message", "ytdl-prefetch-now")
             draw_playlist()
         else
             local filtered = compute_filtered(mp.get_property_native("playlist") or {})
@@ -646,12 +648,26 @@ local function show_playlist_selector()
         if not moving and search_query == "" then
             move_origin = cursor
             moving = true
+            -- Suspends ytdl-prefetch's playlist observer for the whole
+            -- move gesture, however many UP/DOWN steps and however long
+            -- the user takes deciding - resumed with exactly one accurate
+            -- refresh once the move is committed (do_enter/LEFT/vim_left
+            -- below) or cancelled (the ESC handler below). See
+            -- ytdl_prefetch.lua's own comment above its
+            -- "ytdl-prefetch-suspend" handler for why per-step prefetching
+            -- needs to be avoided outright here, not just deduplicated.
+            mp.commandv("script-message", "ytdl-prefetch-suspend")
             draw_playlist()
         end
     end)
 
     mp.add_forced_key_binding("LEFT", "pl-left", function()
-        if moving then moving = false; draw_playlist() end
+        if moving then
+            moving = false
+            mp.commandv("script-message", "ytdl-prefetch-resume")
+            mp.commandv("script-message", "ytdl-prefetch-now")
+            draw_playlist()
+        end
     end)
 
     mp.add_forced_key_binding("ESC", "pl-esc", function()
@@ -666,6 +682,8 @@ local function show_playlist_selector()
             end
             cursor = move_origin
             moving = false
+            mp.commandv("script-message", "ytdl-prefetch-resume")
+            mp.commandv("script-message", "ytdl-prefetch-now")
             draw_playlist()
         elseif search_query ~= "" then
             search_query = ""
@@ -736,11 +754,18 @@ local function show_playlist_selector()
         if not moving and search_query == "" then
             move_origin = cursor
             moving = true
+            -- See the RIGHT handler above for why this suspends ytdl-prefetch.
+            mp.commandv("script-message", "ytdl-prefetch-suspend")
             draw_playlist()
         end
     end
     local function vim_left()
-        if moving then moving = false; draw_playlist() end
+        if moving then
+            moving = false
+            mp.commandv("script-message", "ytdl-prefetch-resume")
+            mp.commandv("script-message", "ytdl-prefetch-now")
+            draw_playlist()
+        end
     end
     mp.add_forced_key_binding("ctrl+k",  "pl-vim-up",         vim_up)
     mp.add_forced_key_binding("meta+k",  "pl-vim-up-meta",    vim_up)
